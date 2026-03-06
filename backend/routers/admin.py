@@ -330,15 +330,7 @@ async def get_all_benchmarks():
         benchmark = await db.benchmarks.find_one({"sector": sector}, {"_id": 0})
         if benchmark:
             benchmarks.append(benchmark)
-    
-    # If no benchmarks exist, seed with sample data
-    if not benchmarks:
-        await seed_sample_benchmarks()
-        for sector in sectors:
-            benchmark = await db.benchmarks.find_one({"sector": sector}, {"_id": 0})
-            if benchmark:
-                benchmarks.append(benchmark)
-    
+
     return benchmarks
 
 

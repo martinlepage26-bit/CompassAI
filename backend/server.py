@@ -7,6 +7,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import asyncio
+import hashlib
+import json
 from pathlib import Path
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any
@@ -30,7 +32,8 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
 
 # Auth configuration
-SECRET_KEY = os.environ.get('SECRET_KEY', 'agatha-governance-secret-key-2026')
+SECRET_KEY = os.environ.get('SECRET_KEY', 'compass-ai-governance-secret-key-2026')
+COMPASSAI_INGEST_TOKEN = os.environ.get('COMPASSAI_INGEST_TOKEN', '')
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -351,7 +354,289 @@ class Assessment(BaseModel):
     result: Optional[AssessmentResult] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+# ==================== COM-AUR ALIGNMENT MODELS ====================
+def default_use_case_gates() -> Dict[str, str]:
+    return {
+        "intake_complete": "complete",
+        "risk_assessed": "pending",
+        "controls_satisfied": "blocked",
+        "approved_for_deploy": "blocked",
+    }
+
+
+class UseCaseCreate(BaseModel):
+    name: str
+    purpose: str
+    business_owner: str
+    business_owner_confirmed: bool = False
+    systems_involved: List[str] = Field(default_factory=list)
+    data_categories: List[str] = Field(default_factory=list)
+    automation_level: str
+    decision_impact: Optional[str] = None
+    regulated_domain: bool = False
+    regulated_domain_notes: Optional[str] = None
+    scale: str = "limited"
+    known_unknowns: List[str] = Field(default_factory=list)
+    client_id: Optional[str] = None
+    ai_system_id: Optional[str] = None
+
+
+class UseCaseRecord(UseCaseCreate):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    status: str = "intake_complete"
+    current_gate: str = "intake_complete"
+    gates: Dict[str, str] = Field(default_factory=default_use_case_gates)
+    latest_risk_tier: Optional[str] = None
+    latest_assessment_id: Optional[str] = None
+    evidence_count: int = 0
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class EvidenceIngestRequest(BaseModel):
+    usecase_id: str
+    producer: str
+    artifact_type: str
+    payload: Dict[str, Any]
+    hash: str
+    control_checks: Dict[str, Any] = Field(default_factory=dict)
+
+
+class UseCaseAssessmentRecord(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    usecase_id: str
+    risk_tier: str
+    dimension_scores: Dict[str, int]
+    dimension_rationale: Dict[str, str]
+    uncertainty_fields: List[str] = Field(default_factory=list)
+    required_controls: List[str] = Field(default_factory=list)
+    required_deliverables: List[str] = Field(default_factory=list)
+    evidence_count: int = 0
+    gate_status: Dict[str, str] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class UseCaseAuditEntry(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    usecase_id: str
+    event: str
+    actor_id: Optional[str] = None
+    actor_email: Optional[str] = None
+    actor_role: Optional[str] = None
+    rationale: Optional[str] = None
+    evidence_ids: List[str] = Field(default_factory=list)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
 # ==================== GOVERNANCE ENGINE ====================
+
+def iso_timestamp(value: Optional[datetime] = None) -> str:
+    timestamp = value or datetime.now(timezone.utc)
+    return timestamp.isoformat().replace("+00:00", "Z")
+
+
+def canonical_json_bytes(data: Any) -> bytes:
+    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def sha256_json(data: Any) -> str:
+    return f"sha256:{hashlib.sha256(canonical_json_bytes(data)).hexdigest()}"
+
+
+def infer_data_sensitivity(data_categories: List[str]) -> tuple[int, str]:
+    lowered = [item.lower() for item in data_categories]
+    if any(token in item for item in lowered for token in ["biometric", "genetic"]):
+        return 3, "Biometric or similarly sensitive data is in scope."
+    if any(token in item for item in lowered for token in ["phi", "health", "medical", "financial", "bank", "ssn", "government id"]):
+        return 2, "Significant sensitive data is in scope."
+    if any(token in item for item in lowered for token in ["pii", "personal", "contact", "email", "phone", "employee"]):
+        return 1, "Limited personal data is in scope."
+    return 0, "No sensitive data categories were declared."
+
+
+def infer_decision_impact(decision_impact: Optional[str], automation_level: Optional[str]) -> tuple[int, str]:
+    descriptor = " ".join([decision_impact or "", automation_level or ""]).strip().lower()
+    if any(token in descriptor for token in ["consequential", "termination", "credit", "benefits", "law enforcement", "fully automated"]):
+        return 3, "Consequential or fully automated decision-making is in scope."
+    if any(token in descriptor for token in ["automated", "high impact", "decisioning", "production decision"]):
+        return 2, "Automated or high-impact decision logic is in scope."
+    if any(token in descriptor for token in ["assistive", "recommend", "human-in-the-loop", "advisory"]):
+        return 1, "Assistive or human-in-the-loop decision support is in scope."
+    if any(token in descriptor for token in ["informational", "informative", "reference only"]):
+        return 0, "Decision output is limited to informational support."
+    return 1, "Decision impact is underspecified, so the use case is treated conservatively."
+
+
+def infer_regulated_domain(regulated_domain: bool, notes: Optional[str]) -> tuple[int, str]:
+    note_text = (notes or "").lower()
+    if regulated_domain and any(token in note_text for token in ["high-risk", "medical device", "employment", "credit", "biometric", "law enforcement"]):
+        return 3, "The use case is declared in a strict or high-risk regulated domain."
+    if regulated_domain:
+        return 2, "The use case is declared in a regulated domain."
+    return 0, "No regulated domain flag was declared."
+
+
+def infer_scale(scale: Optional[str]) -> tuple[int, str]:
+    normalized = (scale or "").strip().lower()
+    if normalized in {"limited", "pilot", "sandbox"}:
+        return 0, "Scale is limited."
+    if normalized in {"team", "department", "internal"}:
+        return 1, "Scale is moderate."
+    if normalized in {"business-unit", "business_unit", "enterprise", "regional"}:
+        return 2, "Scale is broad enough to increase governance exposure."
+    if normalized in {"public", "consumer", "population", "mass"}:
+        return 3, "Scale is public or population-level."
+    return 1, "Scale is underspecified, so the use case is treated conservatively."
+
+
+def collect_risk_uncertainties(use_case: Dict[str, Any]) -> List[str]:
+    uncertainty_fields = []
+    data_categories = [str(item).lower() for item in use_case.get("data_categories", [])]
+    decision_descriptor = " ".join(
+        [use_case.get("decision_impact") or "", use_case.get("automation_level") or ""]
+    ).strip().lower()
+    scale = (use_case.get("scale") or "").strip().lower()
+
+    if not data_categories or any(token in item for item in data_categories for token in ["unknown", "tbd", "undetermined"]):
+        uncertainty_fields.append("data_categories")
+    if not decision_descriptor or any(token in decision_descriptor for token in ["unknown", "tbd", "undetermined"]):
+        uncertainty_fields.append("decision_impact")
+    if not scale or scale in {"unknown", "tbd", "undetermined"}:
+        uncertainty_fields.append("scale")
+    return uncertainty_fields
+
+
+def derive_required_controls(
+    risk_tier: str,
+    use_case: Dict[str, Any],
+    evidence_records: List[Dict[str, Any]],
+) -> List[str]:
+    controls_by_tier = {
+        "T0": [
+            "use_case_registry_entry",
+            "basic_logging",
+            "named_business_owner",
+            "periodic_review_schedule",
+        ],
+        "T1": [
+            "use_case_registry_entry",
+            "basic_logging",
+            "named_business_owner",
+            "periodic_review_schedule",
+            "rbac",
+            "audit_logging",
+            "monthly_monitoring_review",
+        ],
+        "T2": [
+            "use_case_registry_entry",
+            "basic_logging",
+            "named_business_owner",
+            "periodic_review_schedule",
+            "rbac",
+            "audit_logging",
+            "risk_assessment",
+            "hitl_for_low_confidence_outputs",
+            "enhanced_monitoring_with_alerting",
+            "approval_record",
+        ],
+        "T3": [
+            "use_case_registry_entry",
+            "basic_logging",
+            "named_business_owner",
+            "periodic_review_schedule",
+            "rbac",
+            "audit_logging",
+            "risk_assessment",
+            "hitl_for_low_confidence_outputs",
+            "enhanced_monitoring_with_alerting",
+            "approval_record",
+            "independent_review",
+            "red_team_assessment",
+            "named_approvers_by_role",
+            "recertification_schedule",
+        ],
+    }
+
+    controls = list(controls_by_tier[risk_tier])
+    categories = " ".join(use_case.get("data_categories", [])).lower()
+    if any(token in categories for token in ["pii", "personal", "health", "medical", "financial", "biometric"]):
+        controls.append("retention_policy_documented")
+    if risk_tier in {"T2", "T3"} and any(
+        record.get("control_checks", {}).get("review_required") for record in evidence_records
+    ):
+        controls.append("hitl_validation_workflow")
+
+    return sorted(set(controls))
+
+
+def derive_required_deliverables(risk_tier: str, use_case: Dict[str, Any]) -> List[str]:
+    deliverables_by_tier = {
+        "T0": ["use_case_record"],
+        "T1": ["use_case_record", "model_card", "monitoring_plan"],
+        "T2": [
+            "use_case_record",
+            "model_card",
+            "risk_assessment",
+            "dpia",
+            "monitoring_plan_with_alert_thresholds",
+            "approval_record",
+        ],
+        "T3": [
+            "use_case_record",
+            "model_card",
+            "risk_assessment",
+            "dpia",
+            "monitoring_plan_with_alert_thresholds",
+            "approval_record",
+            "independent_review_report",
+            "red_team_findings",
+            "recertification_schedule",
+        ],
+    }
+
+    deliverables = list(deliverables_by_tier[risk_tier])
+    categories = " ".join(use_case.get("data_categories", [])).lower()
+    if risk_tier in {"T2", "T3"} and not any(token in categories for token in ["pii", "personal", "health", "medical", "financial", "biometric"]):
+        deliverables = [item for item in deliverables if item != "dpia"]
+    return deliverables
+
+
+def assess_use_case_risk(use_case: Dict[str, Any]) -> Dict[str, Any]:
+    data_score, data_rationale = infer_data_sensitivity(use_case.get("data_categories", []))
+    impact_score, impact_rationale = infer_decision_impact(
+        use_case.get("decision_impact"),
+        use_case.get("automation_level"),
+    )
+    regulated_score, regulated_rationale = infer_regulated_domain(
+        bool(use_case.get("regulated_domain")),
+        use_case.get("regulated_domain_notes"),
+    )
+    scale_score, scale_rationale = infer_scale(use_case.get("scale"))
+
+    dimension_scores = {
+        "data_sensitivity": data_score,
+        "decision_impact": impact_score,
+        "regulated_domain": regulated_score,
+        "scale": scale_score,
+    }
+    dimension_rationale = {
+        "data_sensitivity": data_rationale,
+        "decision_impact": impact_rationale,
+        "regulated_domain": regulated_rationale,
+        "scale": scale_rationale,
+    }
+
+    uncertainty_fields = collect_risk_uncertainties(use_case)
+    base_tier = max(dimension_scores.values())
+    final_tier_score = min(3, base_tier + 1) if uncertainty_fields else base_tier
+
+    return {
+        "risk_tier": f"T{final_tier_score}",
+        "dimension_scores": dimension_scores,
+        "dimension_rationale": dimension_rationale,
+        "uncertainty_fields": uncertainty_fields,
+    }
 
 # Status to points mapping
 def status_to_points(status: str) -> int:
@@ -1147,6 +1432,19 @@ async def require_auth(credentials: HTTPAuthorizationCredentials = Depends(secur
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user
 
+
+async def require_evidence_ingest_access(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> Dict:
+    """Allow evidence ingest via service token or a normal authenticated user."""
+    if credentials and COMPASSAI_INGEST_TOKEN and credentials.credentials == COMPASSAI_INGEST_TOKEN:
+        return {
+            "id": "service:aurorai",
+            "email": "aurorai-service@local",
+            "role": "service_ingest",
+        }
+    return await require_auth(credentials)
+
 async def require_role(required_roles: List[UserRole], credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict:
     """Require specific role(s). Raises 403 if not authorized."""
     user = await require_auth(credentials)
@@ -1189,6 +1487,30 @@ async def log_audit(
     )
     await db.audit_logs.insert_one(audit_entry.model_dump())
     return audit_entry
+
+
+async def append_use_case_audit_entry(
+    usecase_id: str,
+    event: str,
+    user: Optional[Dict[str, Any]] = None,
+    rationale: Optional[str] = None,
+    evidence_ids: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    entry = UseCaseAuditEntry(
+        usecase_id=usecase_id,
+        event=event,
+        actor_id=user.get("id") if user else None,
+        actor_email=user.get("email") if user else None,
+        actor_role=user.get("role") if user else None,
+        rationale=rationale,
+        evidence_ids=evidence_ids or [],
+        metadata=metadata or {},
+    )
+    doc = entry.model_dump()
+    doc["timestamp"] = iso_timestamp(entry.timestamp)
+    await db.use_case_audit_entries.insert_one(dict(doc))
+    return doc
 
 # ==================== EMAIL NOTIFICATIONS ====================
 
@@ -1355,6 +1677,257 @@ async def list_users(user: Dict = Depends(require_auth)):
     
     users = await db.users.find({}, {"_id": 0, "hashed_password": 0}).to_list(100)
     return users
+
+# ----- COM-AUR ALIGNMENT -----
+@api_router.post("/v1/use-cases")
+async def create_use_case_record(
+    use_case_data: UseCaseCreate,
+    user: Dict = Depends(require_auth),
+):
+    """Create a canonical use-case registry entry for the governance workflow."""
+    if not use_case_data.business_owner_confirmed:
+        raise HTTPException(status_code=400, detail="business_owner_confirmed must be true before intake is marked complete")
+    if not use_case_data.systems_involved:
+        raise HTTPException(status_code=400, detail="systems_involved must include at least one system")
+    if not use_case_data.data_categories:
+        raise HTTPException(status_code=400, detail="data_categories must include at least one category")
+    if not use_case_data.known_unknowns:
+        raise HTTPException(status_code=400, detail="known_unknowns must include at least one unresolved or monitored item")
+
+    use_case = UseCaseRecord(**use_case_data.model_dump())
+    doc = use_case.model_dump()
+    doc["created_at"] = iso_timestamp(use_case.created_at)
+    doc["updated_at"] = iso_timestamp(use_case.updated_at)
+    await db.use_cases.insert_one(dict(doc))
+
+    await append_use_case_audit_entry(
+        usecase_id=use_case.id,
+        event="intake_complete",
+        user=user,
+        rationale="Canonical use-case record created with required intake fields.",
+        metadata={"gate": "intake_complete"},
+    )
+    await log_audit(
+        AuditAction.CREATE,
+        "use_case",
+        use_case.id,
+        use_case.name,
+        details={"gate": "intake_complete"},
+        user=user,
+    )
+    return doc
+
+
+@api_router.get("/v1/use-cases")
+async def list_use_case_records(
+    client_id: Optional[str] = None,
+    status: Optional[str] = None,
+    user: Dict = Depends(require_auth),
+):
+    """List registered governance use cases."""
+    _ = user
+    query: Dict[str, Any] = {}
+    if client_id:
+        query["client_id"] = client_id
+    if status:
+        query["status"] = status
+
+    use_cases = await db.use_cases.find(query, {"_id": 0}).sort("updated_at", -1).to_list(500)
+    return {"use_cases": use_cases}
+
+
+@api_router.get("/v1/use-cases/{usecase_id}")
+async def get_use_case_record(usecase_id: str, user: Dict = Depends(require_auth)):
+    """Get a single governance use-case record."""
+    _ = user
+    use_case = await db.use_cases.find_one({"id": usecase_id}, {"_id": 0})
+    if not use_case:
+        raise HTTPException(status_code=404, detail="Use case not found")
+    return use_case
+
+
+@api_router.post("/v1/evidence")
+async def ingest_use_case_evidence(
+    evidence_request: EvidenceIngestRequest,
+    user: Dict = Depends(require_evidence_ingest_access),
+):
+    """Ingest a versioned evidence package from AurorAI or another execution layer."""
+    use_case = await db.use_cases.find_one({"id": evidence_request.usecase_id}, {"_id": 0})
+    if not use_case:
+        raise HTTPException(status_code=404, detail="Use case not found")
+
+    expected_hash = sha256_json(evidence_request.payload)
+    if expected_hash != evidence_request.hash:
+        raise HTTPException(status_code=400, detail="Evidence hash does not match payload")
+
+    version = await db.use_case_evidence.count_documents(
+        {
+            "usecase_id": evidence_request.usecase_id,
+            "producer": evidence_request.producer,
+            "artifact_type": evidence_request.artifact_type,
+        }
+    ) + 1
+
+    evidence_id = str(uuid.uuid4())
+    ingested_at = iso_timestamp()
+    evidence_doc = {
+        "id": evidence_id,
+        "usecase_id": evidence_request.usecase_id,
+        "producer": evidence_request.producer,
+        "artifact_type": evidence_request.artifact_type,
+        "payload": evidence_request.payload,
+        "hash": evidence_request.hash,
+        "control_checks": evidence_request.control_checks,
+        "schema_version": evidence_request.payload.get("evidence_package", {}).get("schema_version"),
+        "version": version,
+        "ingested_at": ingested_at,
+    }
+
+    await db.use_case_evidence.insert_one(dict(evidence_doc))
+
+    evidence_count = await db.use_case_evidence.count_documents({"usecase_id": evidence_request.usecase_id})
+    await db.use_cases.update_one(
+        {"id": evidence_request.usecase_id},
+        {
+            "$set": {
+                "evidence_count": evidence_count,
+                "updated_at": ingested_at,
+            }
+        },
+    )
+
+    await append_use_case_audit_entry(
+        usecase_id=evidence_request.usecase_id,
+        event="evidence_ingested",
+        user=user,
+        rationale="Evidence package ingested after hash verification.",
+        evidence_ids=[evidence_id],
+        metadata={
+            "version": version,
+            "producer": evidence_request.producer,
+            "artifact_type": evidence_request.artifact_type,
+        },
+    )
+    await log_audit(
+        AuditAction.CREATE,
+        "use_case_evidence",
+        evidence_id,
+        evidence_request.producer,
+        details={
+            "usecase_id": evidence_request.usecase_id,
+            "version": version,
+        },
+        user=user,
+    )
+
+    return evidence_doc
+
+
+@api_router.get("/v1/evidence/use-case/{usecase_id}")
+async def list_use_case_evidence(usecase_id: str, user: Dict = Depends(require_auth)):
+    """List append-only evidence records for a use case."""
+    _ = user
+    use_case = await db.use_cases.find_one({"id": usecase_id}, {"_id": 0, "id": 1})
+    if not use_case:
+        raise HTTPException(status_code=404, detail="Use case not found")
+
+    evidence_records = await db.use_case_evidence.find(
+        {"usecase_id": usecase_id},
+        {"_id": 0},
+    ).sort("version", -1).to_list(500)
+    return {"evidence": evidence_records}
+
+
+@api_router.post("/v1/use-cases/{usecase_id}/assess")
+async def assess_use_case_record(usecase_id: str, user: Dict = Depends(require_auth)):
+    """Run first-pass risk tiering and control derivation for a registered use case."""
+    use_case = await db.use_cases.find_one({"id": usecase_id}, {"_id": 0})
+    if not use_case:
+        raise HTTPException(status_code=404, detail="Use case not found")
+
+    evidence_records = await db.use_case_evidence.find({"usecase_id": usecase_id}, {"_id": 0}).to_list(500)
+    risk_result = assess_use_case_risk(use_case)
+    required_controls = derive_required_controls(risk_result["risk_tier"], use_case, evidence_records)
+    required_deliverables = derive_required_deliverables(risk_result["risk_tier"], use_case)
+
+    gate_status = dict(use_case.get("gates") or default_use_case_gates())
+    gate_status["risk_assessed"] = "complete"
+    gate_status["controls_satisfied"] = "pending" if evidence_records else "blocked"
+    gate_status["approved_for_deploy"] = "blocked"
+
+    assessment = UseCaseAssessmentRecord(
+        usecase_id=usecase_id,
+        risk_tier=risk_result["risk_tier"],
+        dimension_scores=risk_result["dimension_scores"],
+        dimension_rationale=risk_result["dimension_rationale"],
+        uncertainty_fields=risk_result["uncertainty_fields"],
+        required_controls=required_controls,
+        required_deliverables=required_deliverables,
+        evidence_count=len(evidence_records),
+        gate_status=gate_status,
+    )
+    assessment_doc = assessment.model_dump()
+    assessment_doc["created_at"] = iso_timestamp(assessment.created_at)
+    await db.use_case_assessments.insert_one(dict(assessment_doc))
+
+    status_event = "risk_assessed"
+    prior_tier = use_case.get("latest_risk_tier")
+    if prior_tier and prior_tier != assessment.risk_tier:
+        status_event = "risk_reassessed"
+
+    updated_at = iso_timestamp()
+    await db.use_cases.update_one(
+        {"id": usecase_id},
+        {
+            "$set": {
+                "latest_risk_tier": assessment.risk_tier,
+                "latest_assessment_id": assessment.id,
+                "current_gate": "risk_assessed",
+                "status": "risk_assessed",
+                "gates": gate_status,
+                "updated_at": updated_at,
+            }
+        },
+    )
+
+    await append_use_case_audit_entry(
+        usecase_id=usecase_id,
+        event=status_event,
+        user=user,
+        rationale=f"{assessment.risk_tier} assigned with explicit dimension rationale and uncertainty capture.",
+        metadata={
+            "prior_tier": prior_tier,
+            "new_tier": assessment.risk_tier,
+            "uncertainty_fields": assessment.uncertainty_fields,
+            "required_controls": required_controls,
+            "required_deliverables": required_deliverables,
+        },
+    )
+    await log_audit(
+        AuditAction.CREATE,
+        "use_case_assessment",
+        assessment.id,
+        assessment.risk_tier,
+        details={"usecase_id": usecase_id},
+        user=user,
+    )
+
+    return assessment_doc
+
+
+@api_router.get("/v1/use-cases/{usecase_id}/audit-trail")
+async def get_use_case_audit_trail(usecase_id: str, user: Dict = Depends(require_auth)):
+    """Return append-only audit trail entries for a governance use case."""
+    _ = user
+    use_case = await db.use_cases.find_one({"id": usecase_id}, {"_id": 0, "id": 1})
+    if not use_case:
+        raise HTTPException(status_code=404, detail="Use case not found")
+
+    entries = await db.use_case_audit_entries.find(
+        {"usecase_id": usecase_id},
+        {"_id": 0},
+    ).sort("timestamp", 1).to_list(1000)
+    return {"audit_trail": entries}
 
 # ----- CLIENTS -----
 @api_router.post("/clients", response_model=Client)
@@ -3087,15 +3660,7 @@ async def get_all_benchmarks():
         benchmark = await db.benchmarks.find_one({"sector": sector}, {"_id": 0})
         if benchmark:
             benchmarks.append(benchmark)
-    
-    # If no benchmarks exist, seed with sample data
-    if not benchmarks:
-        await seed_sample_benchmarks()
-        for sector in sectors:
-            benchmark = await db.benchmarks.find_one({"sector": sector}, {"_id": 0})
-            if benchmark:
-                benchmarks.append(benchmark)
-    
+
     return benchmarks
 
 @api_router.post("/benchmarks/seed")

@@ -8,7 +8,6 @@ Provides multi-LLM support (GPT-5.2, Claude, Gemini) for:
 
 import os
 import json
-import uuid
 import asyncio
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
@@ -16,7 +15,7 @@ from pathlib import Path
 
 load_dotenv(Path(__file__).parent / '.env')
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from emergentintegrations.llm.chat import LlmChat, SystemMessage, UserMessage
 
 # Get API key
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
@@ -34,17 +33,29 @@ class AIService:
     
     def __init__(self, model_key: str = "gpt-5.2"):
         self.model_config = MODELS.get(model_key, MODELS["gpt-5.2"])
-        self.api_key = EMERGENT_LLM_KEY
+        self.api_key = os.environ.get("OPENAI_API_KEY") or EMERGENT_LLM_KEY
+        self.base_url = os.environ.get("OPENAI_BASE_URL")
     
-    def _create_chat(self, system_message: str, session_id: str = None) -> LlmChat:
-        """Create a new LlmChat instance with the configured model"""
-        chat = LlmChat(
+    def _create_chat(self) -> LlmChat:
+        """Create a new OpenAI-compatible LlmChat instance."""
+        return LlmChat(
+            model=self.model_config["model"],
             api_key=self.api_key,
-            session_id=session_id or str(uuid.uuid4()),
-            system_message=system_message
+            base_url=self.base_url,
         )
-        chat.with_model(self.model_config["provider"], self.model_config["model"])
-        return chat
+
+    async def _send_prompt(self, system_message: str, prompt: str) -> Optional[str]:
+        if not self.api_key:
+            return None
+
+        chat = self._create_chat()
+        return await asyncio.to_thread(
+            chat.chat,
+            [
+                SystemMessage(content=system_message),
+                UserMessage(content=prompt),
+            ],
+        )
 
     async def generate_executive_summary(self, assessment_data: Dict[str, Any]) -> str:
         """Generate an executive summary from assessment results"""
@@ -71,9 +82,11 @@ Provide:
 4. Priority recommendations (3 bullets)
 """
         
-        chat = self._create_chat(system_message)
-        response = await chat.send_message(UserMessage(text=prompt))
-        return response
+        try:
+            response = await self._send_prompt(system_message, prompt)
+            return response or "Executive summary unavailable. Confirm the configured LLM endpoint and credentials."
+        except Exception as exc:
+            return f"Executive summary unavailable. Confirm the configured LLM endpoint and credentials. ({exc})"
 
     async def generate_remediation_plan(self, assessment_data: Dict[str, Any], sector: str) -> Dict[str, List[str]]:
         """Generate AI-powered remediation recommendations"""
@@ -106,17 +119,19 @@ Generate a JSON response with this exact structure:
 Be specific and actionable. Include timeframes and responsible parties where relevant.
 """
         
-        chat = self._create_chat(system_message)
-        response = await chat.send_message(UserMessage(text=prompt))
+        try:
+            response = await self._send_prompt(system_message, prompt)
+        except Exception:
+            response = None
         
         # Parse JSON from response
         try:
             # Try to extract JSON from the response
             import re
-            json_match = re.search(r'\{[\s\S]*\}', response)
+            json_match = re.search(r'\{[\s\S]*\}', response or "")
             if json_match:
                 return json.loads(json_match.group())
-        except:
+        except Exception:
             pass
         
         # Fallback structure
@@ -158,15 +173,17 @@ Provide analysis as JSON:
 }}
 """
         
-        chat = self._create_chat(system_message)
-        response = await chat.send_message(UserMessage(text=prompt))
+        try:
+            response = await self._send_prompt(system_message, prompt)
+        except Exception:
+            response = None
         
         try:
             import re
-            json_match = re.search(r'\{[\s\S]*\}', response)
+            json_match = re.search(r'\{[\s\S]*\}', response or "")
             if json_match:
                 return json.loads(json_match.group())
-        except:
+        except Exception:
             pass
         
         return {
@@ -209,15 +226,17 @@ Provide as JSON:
 }}
 """
         
-        chat = self._create_chat(system_message)
-        response = await chat.send_message(UserMessage(text=prompt))
+        try:
+            response = await self._send_prompt(system_message, prompt)
+        except Exception:
+            response = None
         
         try:
             import re
-            json_match = re.search(r'\{[\s\S]*\}', response)
+            json_match = re.search(r'\{[\s\S]*\}', response or "")
             if json_match:
                 return json.loads(json_match.group())
-        except:
+        except Exception:
             pass
         
         return {
@@ -259,15 +278,17 @@ Provide as JSON:
 }}
 """
         
-        chat = self._create_chat(system_message)
-        response = await chat.send_message(UserMessage(text=prompt))
+        try:
+            response = await self._send_prompt(system_message, prompt)
+        except Exception:
+            response = None
         
         try:
             import re
-            json_match = re.search(r'\{[\s\S]*\}', response)
+            json_match = re.search(r'\{[\s\S]*\}', response or "")
             if json_match:
                 return json.loads(json_match.group())
-        except:
+        except Exception:
             pass
         
         return {
@@ -314,15 +335,17 @@ Extract as JSON:
 }}
 """
         
-        chat = self._create_chat(system_message)
-        response = await chat.send_message(UserMessage(text=prompt))
+        try:
+            response = await self._send_prompt(system_message, prompt)
+        except Exception:
+            response = None
         
         try:
             import re
-            json_match = re.search(r'\{[\s\S]*\}', response)
+            json_match = re.search(r'\{[\s\S]*\}', response or "")
             if json_match:
                 return json.loads(json_match.group())
-        except:
+        except Exception:
             pass
         
         return {
