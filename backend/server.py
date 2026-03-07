@@ -386,9 +386,12 @@ class UseCaseRecord(UseCaseCreate):
     status: str = "intake_complete"
     current_gate: str = "intake_complete"
     gates: Dict[str, str] = Field(default_factory=default_use_case_gates)
+    current_cycle_id: Optional[str] = None
+    cycle_index: int = 0
     latest_risk_tier: Optional[str] = None
     latest_assessment_id: Optional[str] = None
     evidence_count: int = 0
+    feedback_action_count: int = 0
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -405,6 +408,9 @@ class EvidenceIngestRequest(BaseModel):
 class UseCaseAssessmentRecord(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     usecase_id: str
+    cycle_id: str
+    parent_assessment_id: Optional[str] = None
+    trigger_type: str = "initial_assessment"
     risk_tier: str
     dimension_scores: Dict[str, int]
     dimension_rationale: Dict[str, str]
@@ -427,6 +433,29 @@ class UseCaseAuditEntry(BaseModel):
     evidence_ids: List[str] = Field(default_factory=list)
     metadata: Dict[str, Any] = Field(default_factory=dict)
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class GovernanceCycleRecord(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    usecase_id: str
+    parent_cycle_id: Optional[str] = None
+    cycle_index: int = 1
+    open_reason: str
+    status: str = "open"
+    opened_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    closed_at: Optional[datetime] = None
+
+
+class FeedbackActionRecord(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    usecase_id: str
+    cycle_id: str
+    source_assessment_id: Optional[str] = None
+    action_type: str
+    requested_state: str
+    rationale: str
+    status: str = "open"
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
 # ==================== GOVERNANCE ENGINE ====================
@@ -1512,6 +1541,43 @@ async def append_use_case_audit_entry(
     await db.use_case_audit_entries.insert_one(dict(doc))
     return doc
 
+
+def build_governance_cycle(
+    use_case: Dict[str, Any],
+    *,
+    open_reason: str,
+    parent_cycle_id: Optional[str] = None,
+) -> GovernanceCycleRecord:
+    return GovernanceCycleRecord(
+        usecase_id=use_case["id"],
+        parent_cycle_id=parent_cycle_id,
+        cycle_index=int(use_case.get("cycle_index") or 0) + 1,
+        open_reason=open_reason,
+    )
+
+
+async def append_feedback_action(
+    *,
+    use_case: Dict[str, Any],
+    cycle_id: str,
+    source_assessment_id: Optional[str],
+    action_type: str,
+    requested_state: str,
+    rationale: str,
+) -> Dict[str, Any]:
+    action = FeedbackActionRecord(
+        usecase_id=use_case["id"],
+        cycle_id=cycle_id,
+        source_assessment_id=source_assessment_id,
+        action_type=action_type,
+        requested_state=requested_state,
+        rationale=rationale,
+    )
+    doc = action.model_dump()
+    doc["created_at"] = iso_timestamp(action.created_at)
+    await db.feedback_actions.insert_one(dict(doc))
+    return doc
+
 # ==================== EMAIL NOTIFICATIONS ====================
 
 async def send_evidence_notification(
@@ -1695,17 +1761,26 @@ async def create_use_case_record(
         raise HTTPException(status_code=400, detail="known_unknowns must include at least one unresolved or monitored item")
 
     use_case = UseCaseRecord(**use_case_data.model_dump())
+    initial_cycle = build_governance_cycle(
+        {"id": use_case.id, "cycle_index": 0},
+        open_reason="initial_intake",
+    )
+    use_case.current_cycle_id = initial_cycle.id
+    use_case.cycle_index = initial_cycle.cycle_index
     doc = use_case.model_dump()
     doc["created_at"] = iso_timestamp(use_case.created_at)
     doc["updated_at"] = iso_timestamp(use_case.updated_at)
     await db.use_cases.insert_one(dict(doc))
+    cycle_doc = initial_cycle.model_dump()
+    cycle_doc["opened_at"] = iso_timestamp(initial_cycle.opened_at)
+    await db.governance_cycles.insert_one(dict(cycle_doc))
 
     await append_use_case_audit_entry(
         usecase_id=use_case.id,
         event="intake_complete",
         user=user,
         rationale="Canonical use-case record created with required intake fields.",
-        metadata={"gate": "intake_complete"},
+        metadata={"gate": "intake_complete", "cycle_id": initial_cycle.id, "cycle_index": initial_cycle.cycle_index},
     )
     await log_audit(
         AuditAction.CREATE,
@@ -1786,12 +1861,23 @@ async def ingest_use_case_evidence(
     await db.use_case_evidence.insert_one(dict(evidence_doc))
 
     evidence_count = await db.use_case_evidence.count_documents({"usecase_id": evidence_request.usecase_id})
+    feedback_doc = None
+    if use_case.get("latest_assessment_id"):
+        feedback_doc = await append_feedback_action(
+            use_case=use_case,
+            cycle_id=use_case.get("current_cycle_id") or "",
+            source_assessment_id=use_case.get("latest_assessment_id"),
+            action_type="reassess_due_to_new_evidence",
+            requested_state="risk_reassessment_required",
+            rationale="New evidence changed the record after a prior assessment and should trigger reassessment.",
+        )
     await db.use_cases.update_one(
         {"id": evidence_request.usecase_id},
         {
             "$set": {
                 "evidence_count": evidence_count,
                 "updated_at": ingested_at,
+                "feedback_action_count": int(use_case.get("feedback_action_count") or 0) + (1 if feedback_doc else 0),
             }
         },
     )
@@ -1806,6 +1892,7 @@ async def ingest_use_case_evidence(
             "version": version,
             "producer": evidence_request.producer,
             "artifact_type": evidence_request.artifact_type,
+            "feedback_action_id": feedback_doc["id"] if feedback_doc else None,
         },
     )
     await log_audit(
@@ -1849,6 +1936,28 @@ async def assess_use_case_record(usecase_id: str, user: Dict = Depends(require_a
     risk_result = assess_use_case_risk(use_case)
     required_controls = derive_required_controls(risk_result["risk_tier"], use_case, evidence_records)
     required_deliverables = derive_required_deliverables(risk_result["risk_tier"], use_case)
+    prior_tier = use_case.get("latest_risk_tier")
+    prior_assessment_id = use_case.get("latest_assessment_id")
+    trigger_type = "reassessment" if prior_assessment_id else "initial_assessment"
+
+    current_cycle_id = use_case.get("current_cycle_id")
+    cycle_index = int(use_case.get("cycle_index") or 0)
+    if prior_assessment_id or not current_cycle_id:
+        next_cycle = build_governance_cycle(
+            use_case,
+            open_reason="reassessment_after_new_evidence" if prior_assessment_id else "initial_assessment",
+            parent_cycle_id=current_cycle_id,
+        )
+        next_cycle_doc = next_cycle.model_dump()
+        next_cycle_doc["opened_at"] = iso_timestamp(next_cycle.opened_at)
+        await db.governance_cycles.insert_one(dict(next_cycle_doc))
+        if current_cycle_id:
+            await db.governance_cycles.update_one(
+                {"id": current_cycle_id},
+                {"$set": {"status": "superseded", "closed_at": iso_timestamp()}},
+            )
+        current_cycle_id = next_cycle.id
+        cycle_index = next_cycle.cycle_index
 
     gate_status = dict(use_case.get("gates") or default_use_case_gates())
     gate_status["risk_assessed"] = "complete"
@@ -1857,6 +1966,9 @@ async def assess_use_case_record(usecase_id: str, user: Dict = Depends(require_a
 
     assessment = UseCaseAssessmentRecord(
         usecase_id=usecase_id,
+        cycle_id=current_cycle_id or str(uuid.uuid4()),
+        parent_assessment_id=prior_assessment_id,
+        trigger_type=trigger_type,
         risk_tier=risk_result["risk_tier"],
         dimension_scores=risk_result["dimension_scores"],
         dimension_rationale=risk_result["dimension_rationale"],
@@ -1871,7 +1983,6 @@ async def assess_use_case_record(usecase_id: str, user: Dict = Depends(require_a
     await db.use_case_assessments.insert_one(dict(assessment_doc))
 
     status_event = "risk_assessed"
-    prior_tier = use_case.get("latest_risk_tier")
     if prior_tier and prior_tier != assessment.risk_tier:
         status_event = "risk_reassessed"
 
@@ -1882,6 +1993,8 @@ async def assess_use_case_record(usecase_id: str, user: Dict = Depends(require_a
             "$set": {
                 "latest_risk_tier": assessment.risk_tier,
                 "latest_assessment_id": assessment.id,
+                "current_cycle_id": assessment.cycle_id,
+                "cycle_index": cycle_index,
                 "current_gate": "risk_assessed",
                 "status": "risk_assessed",
                 "gates": gate_status,
@@ -1898,6 +2011,9 @@ async def assess_use_case_record(usecase_id: str, user: Dict = Depends(require_a
         metadata={
             "prior_tier": prior_tier,
             "new_tier": assessment.risk_tier,
+            "cycle_id": assessment.cycle_id,
+            "parent_assessment_id": assessment.parent_assessment_id,
+            "trigger_type": assessment.trigger_type,
             "uncertainty_fields": assessment.uncertainty_fields,
             "required_controls": required_controls,
             "required_deliverables": required_deliverables,
